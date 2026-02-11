@@ -48,12 +48,7 @@ class InvoiceService:
                 problems.append(f"Unknown category for {it.sku}")
         return problems
 
-    def compute_total(self, inv: Invoice) -> Tuple[float, List[str]]:
-        warnings: List[str] = []
-        problems = self._validate(inv)
-        if problems:
-            raise ValueError("; ".join(problems))
-
+    def _subtotal_and_fragile_fee(self, inv: Invoice) -> Tuple[float, float]:
         subtotal = 0.0
         fragile_fee = 0.0
         for it in inv.items:
@@ -61,62 +56,69 @@ class InvoiceService:
             subtotal += line
             if it.fragile:
                 fragile_fee += 5.0 * it.qty
+        return subtotal, fragile_fee
 
-        shipping = 0.0
-        if inv.country == "TH":
-            if subtotal < 500:
-                shipping = 60
-            else:
-                shipping = 0
-        elif inv.country == "JP":
-            if subtotal < 4000:
-                shipping = 600
-            else:
-                shipping = 0
-        elif inv.country == "US":
+    def _shipping_for(self, country: str, subtotal: float) -> float:
+        if country == "TH":
+            return 60 if subtotal < 500 else 0
+        if country == "JP":
+            return 600 if subtotal < 4000 else 0
+        if country == "US":
             if subtotal < 100:
-                shipping = 15
-            elif subtotal < 300:
-                shipping = 8
-            else:
-                shipping = 0
-        else:
-            if subtotal < 200:
-                shipping = 25
-            else:
-                shipping = 0
+                return 15
+            if subtotal < 300:
+                return 8
+            return 0
+        return 25 if subtotal < 200 else 0
 
-        discount = 0.0
-        if inv.membership == "gold":
-            discount += subtotal * 0.03
-        elif inv.membership == "platinum":
-            discount += subtotal * 0.05
-        else:
-            if subtotal > 3000:
-                discount += 20
+    def _base_discount(self, membership: str, subtotal: float) -> float:
+        if membership == "gold":
+            return subtotal * 0.03
+        if membership == "platinum":
+            return subtotal * 0.05
+        return 20 if subtotal > 3000 else 0
 
-        if inv.coupon is not None and inv.coupon.strip() != "":
-            code = inv.coupon.strip()
-            if code in self._coupon_rate:
-                discount += subtotal * self._coupon_rate[code]
-            else:
-                warnings.append("Unknown coupon")
+    def _apply_coupon(self, coupon: Optional[str], subtotal: float, warnings: List[str]) -> float:
+        if coupon is None:
+            return 0.0
+        code = coupon.strip()
+        if not code:
+            return 0.0
+        rate = self._coupon_rate.get(code)
+        if rate is None:
+            warnings.append("Unknown coupon")
+            return 0.0
+        return subtotal * rate
 
-        tax = 0.0
-        if inv.country == "TH":
-            tax = (subtotal - discount) * 0.07
-        elif inv.country == "JP":
-            tax = (subtotal - discount) * 0.10
-        elif inv.country == "US":
-            tax = (subtotal - discount) * 0.08
-        else:
-            tax = (subtotal - discount) * 0.05
+    def _tax_for(self, country: str, taxable_amount: float) -> float:
+        if country == "TH":
+            return taxable_amount * 0.07
+        if country == "JP":
+            return taxable_amount * 0.10
+        if country == "US":
+            return taxable_amount * 0.08
+        return taxable_amount * 0.05
+
+    def _needs_membership_suggestion(self, subtotal: float, membership: str) -> bool:
+        return subtotal > 10000 and membership not in ("gold", "platinum")
+
+    def compute_total(self, inv: Invoice) -> Tuple[float, List[str]]:
+        warnings: List[str] = []
+        problems = self._validate(inv)
+        if problems:
+            raise ValueError("; ".join(problems))
+
+        subtotal, fragile_fee = self._subtotal_and_fragile_fee(inv)
+        shipping = self._shipping_for(inv.country, subtotal)
+        discount = self._base_discount(inv.membership, subtotal)
+        discount += self._apply_coupon(inv.coupon, subtotal, warnings)
+        tax = self._tax_for(inv.country, subtotal - discount)
 
         total = subtotal + shipping + fragile_fee + tax - discount
         if total < 0:
             total = 0
 
-        if subtotal > 10000 and inv.membership not in ("gold", "platinum"):
+        if self._needs_membership_suggestion(subtotal, inv.membership):
             warnings.append("Consider membership upgrade")
 
         return total, warnings
